@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
 Evaluador RDDUNJA · IIA-UNAM
-Servidor de producción — Render.com
+Flask + gunicorn — listo para Render.com
 """
-import base64, io, json, os, re, sys, zipfile
+import base64, io, json, os, re, zipfile
 import xml.etree.ElementTree as ET
 import urllib.error, urllib.request
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from flask import Flask, request, jsonify, send_file
 
-PORT    = int(os.environ.get("PORT", 3000))
+app = Flask(__name__)
+
 API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 # ── Soporte PDF ───────────────────────────────────────────────────
@@ -35,7 +36,7 @@ def extract_file(name: str, data: bytes) -> str:
     n = name.lower()
     if n.endswith(".pdf"):
         if not PDF_OK:
-            raise RuntimeError("PDF no soportado en este servidor. Usa Word (.docx) o Markdown (.md).")
+            raise RuntimeError("PDF no soportado. Usa Word (.docx) o Markdown (.md).")
         return pdf_extract(io.BytesIO(data))
     if n.endswith(".docx") or n.endswith(".doc"):
         return extract_docx(data)
@@ -68,7 +69,7 @@ RÚBRICA (100 pts):
    Ponencia intern.: 0.3 pts c/u (cap 5). Nac.: 0.1 pts c/u (cap 3). Org. eventos: 0.5 c/u (cap 3).
    Comité editorial/colegiado: 1 pt c/u (cap 3). Divulgación: hasta 2 pts.
 
-REGLAS CRÍTICAS:
+REGLAS:
 - Usa los códigos proporcionados (AF01, AF02…). NUNCA incluyas nombres reales ni fechas exactas.
 - Las observaciones deben sonar naturales, como un evaluador senior, no como IA.
 - Aplica todos los caps con rigor.
@@ -113,71 +114,34 @@ def call_claude(api_key: str, conv_text: str, candidates: list) -> dict:
     raw = re.sub(r"```json?\n?", "", raw).replace("```", "").strip()
     return json.loads(raw)
 
-# ── Servidor HTTP ─────────────────────────────────────────────────
-BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
-HTML_PATH = os.path.join(BASE_DIR, "index.html")
+# ── Rutas Flask ───────────────────────────────────────────────────
+@app.route("/")
+def index():
+    return send_file("index.html")
 
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, fmt, *args):
-        print(f"  {self.address_string()} → {fmt % args}")
+@app.route("/analyze", methods=["POST"])
+def analyze():
+    try:
+        body = request.get_json()
+        key  = API_KEY or body.get("api_key", "")
+        if not key:
+            return jsonify({"ok": False, "error": "API Key no configurada."}), 500
 
-    def _cors(self):
-        self.send_header("Access-Control-Allow-Origin",  "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        conv_raw = base64.b64decode(body["convocatoria"]["data"])
+        conv_txt = extract_file(body["convocatoria"]["name"], conv_raw)
 
-    def do_OPTIONS(self):
-        self.send_response(200); self._cors(); self.end_headers()
+        cands = []
+        for c in body["candidates"]:
+            raw  = base64.b64decode(c["data"])
+            text = extract_file(c["name"], raw)
+            cands.append({"code": c["code"], "text": text})
 
-    def do_GET(self):
-        content = open(HTML_PATH, "rb").read()
-        self.send_response(200)
-        self.send_header("Content-Type",   "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(content)))
-        self._cors(); self.end_headers(); self.wfile.write(content)
+        result = call_claude(key, conv_txt, cands)
+        return jsonify({"ok": True, "data": result})
 
-    def do_POST(self):
-        if self.path != "/analyze":
-            self.send_response(404); self.end_headers(); return
-
-        length = int(self.headers.get("Content-Length", 0))
-        body   = json.loads(self.rfile.read(length))
-
-        def respond(status, payload):
-            data = json.dumps(payload).encode()
-            self.send_response(status)
-            self.send_header("Content-Type",   "application/json")
-            self.send_header("Content-Length", str(len(data)))
-            self._cors(); self.end_headers(); self.wfile.write(data)
-
-        try:
-            key = API_KEY or body.get("api_key", "")
-            if not key:
-                raise RuntimeError("API Key no configurada. Contacta al administrador.")
-
-            conv_raw = base64.b64decode(body["convocatoria"]["data"])
-            conv_txt = extract_file(body["convocatoria"]["name"], conv_raw)
-
-            cands = []
-            for c in body["candidates"]:
-                raw  = base64.b64decode(c["data"])
-                text = extract_file(c["name"], raw)
-                cands.append({"code": c["code"], "text": text})
-
-            result = call_claude(key, conv_txt, cands)
-            respond(200, {"ok": True, "data": result})
-
-        except Exception as e:
-            respond(500, {"ok": False, "error": str(e)})
-
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 if __name__ == "__main__":
-    if not API_KEY:
-        print("⚠  ANTHROPIC_API_KEY no está configurada como variable de entorno.")
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
-    print(f"✓ Servidor escuchando en puerto {PORT}")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nServidor cerrado.")
-        sys.exit(0)
+    port = int(os.environ.get("PORT", 3000))
+    app.run(host="0.0.0.0", port=port)
